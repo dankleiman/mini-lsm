@@ -299,11 +299,22 @@ impl LsmStorageInner {
             Arc::clone(&lock)
         };
 
+        // read current memtable
         if let Some(value) = state.memtable.get(_key) {
             if value.is_empty() {
                 return Ok(None);
             }
             return Ok(Some(value));
+        }
+
+        // loop through all immutable memtables
+        for memtable in state.imm_memtables.iter() {
+            if let Some(value) = memtable.get(_key) {
+                if value.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(value));
+            }
         }
         return Ok(None);
     }
@@ -315,20 +326,29 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        // get write lock
-        // set the key-value pair on the state.memtable
-        // not sure what to do about size limit, maybe check before the write?
-        // release write lock
+        let size: usize;
         {
             let lock = self.state.read();
             lock.memtable.put(_key, _value)?;
+            size = lock.memtable.approximate_size();
         }
+        self.try_freeze_memtable(size)?;
         Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
         self.put(_key, &[])?;
+        Ok(())
+    }
+
+    fn try_freeze_memtable(&self, approx_size: usize) -> Result<()> {
+        let state_lock = self.state_lock.lock();
+        let lock = self.state.read();
+        if approx_size >= self.options.target_sst_size {
+            drop(lock);
+            self.force_freeze_memtable(&state_lock)?;
+        }
         Ok(())
     }
 
@@ -354,7 +374,17 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        let mut guard = self.state.write();
+        let mut state = guard.as_ref().clone();
+        let memtable = Arc::new(MemTable::create(self.next_sst_id()));
+        // updates state to have the new memtable, returning the current or "old" memtable
+        let old_memtable = std::mem::replace(&mut state.memtable, memtable);
+        // add the old memtable to the list of immutable memtables so that the last added is first
+        state.imm_memtables.insert(0, old_memtable.clone());
+        // update the state inside the guard with new memtable and updated immutable memtables
+        *guard = Arc::new(state);
+
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
